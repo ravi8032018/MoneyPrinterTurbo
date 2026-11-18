@@ -292,6 +292,21 @@ openai_image_size = ""
 # Example: "cinematic photo of {term}, photorealistic, high detail"
 openai_image_prompt_template = ""
 
+# FreeLLM local image generation fallback (\"freellm_image\").
+# Points to a local FreeLLM server running the OpenAI-compatible /images/generations API.
+# Used as a fallback when stock video pools (Pexels/Pixabay) are exhausted.
+# Default: http://localhost:3001/v1/images/generations
+freellm_base_url = "http://localhost:3001"
+# Optional API keys for the FreeLLM endpoint. Leave empty if no auth required.
+freellm_api_keys = []
+# Model name to use for image generation (e.g., "flux", "sdxl", etc.)
+freellm_image_model = "flux"
+# Optional image size. Default: 1080x1920 (portrait 9:16 for video)
+freellm_image_size = "1080x1920"
+# Optional prompt template. Use "{term}" placeholder for the search term.
+# Example: "cinematic illustration of {term}, highly detailed, 9:16 portrait aspect ratio"
+freellm_image_prompt_template = ""
+
 # Optional TwelveLabs integration for semantic material ranking and video QA.
 # Install the optional dependency with: uv sync --extra twelvelabs
 # Create an API key at https://playground.twelvelabs.io/
@@ -762,10 +777,16 @@ upload_post_max_pending_tasks = 10
 # The model is downloaded automatically on first use unless a matching local
 # directory exists at ./models/whisper-{model_size}.
 model_size = "large-v3"
-# device: "cpu" or "cuda". Common compute types include "int8" for CPU and
-# "float16" or "int8_float16" for CUDA.
-device = "cpu"
-compute_type = "int8"
+# device: "auto", "cpu", or "cuda".
+# - "auto" (recommended): Automatically detect CUDA availability. Uses CUDA with float16
+#   on NVIDIA GPUs (RTX 3050+), falls back to CPU with int8.
+# - "cuda": Force CUDA. Requires NVIDIA GPU and CUDA-enabled faster-whisper.
+# - "cpu": Force CPU inference.
+# Common compute types:
+#   - CPU: "int8" (fastest, lowest VRAM), "int8_float16", "float32"
+#   - CUDA: "float16" (recommended for RTX 3050), "int8_float16" (lower VRAM), "int8", "float32"
+device = "auto"
+compute_type = "auto"
 # Optional prompt that biases Whisper's decoder toward specific vocabulary
 # (brand names, technical terms). Passed as initial_prompt to transcribe().
 # Leave empty to disable.

@@ -4,6 +4,8 @@ from app.controllers import base
 from app.controllers.v1.base import new_router
 from app.models.exception import HttpException
 from app.models.schema import (
+    SceneMapping,
+    SceneMappingResponse,
     VideoScriptRequest,
     VideoScriptResponse,
     VideoSocialMetadataRequest,
@@ -59,6 +61,33 @@ def generate_video_terms(request: Request, body: VideoTermsRequest):
             message="search term generation is unavailable",
         )
     response = {"video_terms": video_terms}
+    return utils.get_response(200, response)
+
+
+@router.post(
+    "/scenes",
+    response_model=SceneMappingResponse,
+    summary="Generate sentence-by-sentence scene mappings with visual search queries",
+)
+def generate_video_scenes(request: Request, body: VideoTermsRequest):
+    """
+    Generate a JSON array mapping each sentence in the script to a concrete
+    visual search query and visual type category.
+
+    This is the preferred endpoint for scene-based video generation, providing
+    deterministic per-sentence search queries instead of global keywords.
+    """
+    scenes = llm.generate_scenes(
+        video_subject=body.video_subject,
+        video_script=body.video_script,
+        amount=body.amount,
+    )
+    if not scenes:
+        raise HttpException(
+            task_id=base.get_task_id(request), status_code=503,
+            message="scene generation is unavailable",
+        )
+    response = {"scenes": scenes}
     return utils.get_response(200, response)
 
 

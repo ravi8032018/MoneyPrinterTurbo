@@ -3,7 +3,7 @@ from enum import Enum
 from typing import Any, List, Literal, Optional, Union
 
 import pydantic
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.config import config
 
@@ -339,6 +339,44 @@ class VideoScriptData(BaseModel):
 
 class VideoTermsData(BaseModel):
     video_terms: List[str]
+
+
+class SceneMapping(BaseModel):
+    """Sentence-by-sentence mapping between script narration and visual search queries.
+
+    Attributes:
+        sentence: The exact script sentence spoken during the scene.
+        search_query: A highly specific, literal, and concrete stock video search query
+            optimized for Pexels/Pixabay (avoid abstract nouns; use concrete visual objects).
+        visual_type: Explicitly categorized as 'stock', 'image', or 'canvas'.
+    """
+    sentence: str = Field(..., description="The exact script sentence spoken during the scene")
+    search_query: str = Field(
+        ...,
+        description="Concrete stock video search query optimized for Pexels/Pixabay. "
+                    "Use concrete visual objects, avoid abstract nouns."
+    )
+    visual_type: str = Field(
+        ...,
+        description="Visual type category: 'stock' for video footage, 'image' for still images, 'canvas' for canvas-generated content"
+    )
+
+    @field_validator('visual_type')
+    @classmethod
+    def validate_visual_type(cls, v: str) -> str:
+        allowed = {'stock', 'image', 'canvas'}
+        normalized = v.strip().lower()
+        if normalized not in allowed:
+            raise ValueError(f"visual_type must be one of {allowed}, got '{v}'")
+        return normalized
+
+
+class SceneMappingResponse(BaseModel):
+    """Response model for scene-based generation endpoint."""
+    scenes: List[SceneMapping] = Field(
+        ...,
+        description="Array of scene mappings with sentence, search_query, and visual_type"
+    )
 
 
 class VideoSocialMetadataData(BaseModel):

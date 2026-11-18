@@ -70,6 +70,46 @@ Generate a script for a video, depending on the subject of the video.
 8. respond in the same language as the video subject.
 """.strip()
 
+# Strict JSON-only system prompt for scene-based generation.
+# Enforces sentence-by-sentence deterministic JSON mapping without any
+# extraneous markdown text or conversational filler outside the JSON block.
+DEFAULT_TERMS_SYSTEM_PROMPT = """
+# Role: Video Scene Matcher
+
+## Goals:
+You are an expert video editor. Given a video script, produce a JSON array that maps
+each spoken sentence to a concrete visual search query suitable for stock video
+footage (Pexels/Pixabay). The output must be a pure JSON array with no surrounding
+text, markdown fences, or commentary.
+
+## Output Format (STRICT JSON ARRAY):
+Return ONLY a JSON array of objects. Each object MUST have exactly these three keys:
+- "sentence": The exact script sentence (copy verbatim from the script)
+- "search_query": A highly specific, literal, and concrete search query.
+  Use concrete visual objects (e.g., "close-up of coffee beans roasting", "a person
+  typing on a laptop in a cafe"). AVOID abstract nouns (e.g., "success", "happiness",
+  "freedom"). Prefer concrete, observable visual elements.
+- "visual_type": One of "stock" (for stock video footage), "image" (for still images),
+  or "canvas" (for canvas-generated content).
+
+## Constraints:
+1. Output ONLY the JSON array. No markdown, no explanations, no code fences.
+2. Each sentence from the script MUST have exactly one mapping entry.
+3. Maintain the same order as the script sentences.
+4. search_query must be in English and optimized for Pexels/Pixabay stock search.
+5. visual_type must be exactly "stock", "image", or "canvas".
+6. Do NOT include any text outside the JSON array.
+7. If the script has multiple paragraphs, process ALL sentences in order.
+
+## Example:
+Script: "Coffee beans are the roasted seeds of the coffee plant. They are used to make coffee."
+Output:
+[
+  {"sentence": "Coffee beans are the roasted seeds of the coffee plant.", "search_query": "close-up of roasted coffee beans on wooden table", "visual_type": "stock"},
+  {"sentence": "They are used to make coffee.", "search_query": "pouring hot coffee into ceramic cup", "visual_type": "stock"}
+]
+""".strip()
+
 # Claude Code CLI 默认使用编码 agent 的系统提示词，其中大量约束与文案写作
 # 无关，会让脚本和关键词生成偏离要求，因此调用时整体替换掉。
 CLAUDE_CODE_SYSTEM_PROMPT = (
@@ -1164,6 +1204,141 @@ Please note that you must use English for generating video search terms; Chinese
     return search_terms
 
 
+def generate_scenes(
+    video_subject: str,
+    video_script: str,
+    amount: int = 5,
+    app_config=None,
+) -> List[dict]:
+    """
+    Generate sentence-by-sentence scene mappings with deterministic JSON output.
+
+    Returns a list of dicts with keys: sentence, search_query, visual_type.
+    Falls back to legacy string-based terms if the LLM response cannot be parsed
+    into the strict JSON structure.
+    """
+    from app.models.schema import SceneMapping
+
+    video_script = utils.remove_pause_tags(video_script or "").strip()
+    if not video_script:
+        logger.error("video_script is empty, cannot generate scenes")
+        return []
+
+    # Split script into sentences for the prompt context
+    # Use simple split on sentence boundaries; the LLM will copy verbatim
+    prompt = f"""{DEFAULT_TERMS_SYSTEM_PROMPT}
+
+## Context:
+### Video Subject
+{video_subject}
+
+### Video Script
+{video_script}
+
+## Task:
+Return a JSON array mapping each sentence in the script to a concrete visual search query.
+Output ONLY the JSON array, nothing else.
+"""
+
+    logger.info(f"generating scenes for subject: {video_subject}")
+
+    scenes: List[dict] = []
+    response = ""
+    for i in range(_max_retries):
+        scenes = []
+        try:
+            if app_config is None:
+                response = _generate_response(prompt)
+            else:
+                response = _generate_response(prompt, app_config=app_config)
+            if isinstance(response, str) and response.startswith("Error: "):
+                logger.error(f"failed to generate scenes: {response}")
+                return []
+            # Try to parse as strict JSON array
+            scenes = _parse_scenes_response(response)
+        except Exception as e:
+            logger.warning(f"failed to generate scenes: {str(e)}")
+            if response:
+                try:
+                    scenes = _parse_scenes_response(response)
+                except (ValueError, json.JSONDecodeError) as parse_err:
+                    logger.warning(f"failed to parse scenes response: {parse_err}")
+
+        if scenes:
+            break
+        if i < _max_retries - 1:
+            logger.warning(f"failed to generate scenes, trying again... {i + 1}")
+
+    logger.success(f"completed: generated {len(scenes)} scenes")
+    return scenes
+
+
+def _parse_scenes_response(response: str) -> List[dict]:
+    """
+    Parse LLM response into a list of scene mapping dicts.
+
+    Handles:
+    - Pure JSON arrays
+    - JSON wrapped in markdown code fences
+    - JSON embedded in prose (extracts first valid JSON array)
+    - Validates required fields (sentence, search_query, visual_type)
+
+    Returns:
+        List[dict]: List of scene mappings with keys sentence, search_query, visual_type
+
+    Raises:
+        ValueError: If no valid JSON array found or validation fails
+    """
+    if not response or not response.strip():
+        raise ValueError("empty response")
+
+    # Strip markdown code fences if present
+    cleaned = _strip_code_fence(response.strip())
+
+    # Try direct JSON parse first
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        # Try to extract embedded JSON array
+        try:
+            data = _extract_embedded_json(cleaned, "[")
+        except ValueError:
+            raise ValueError("response contains no valid JSON array")
+
+    if not isinstance(data, list):
+        raise ValueError("response is not a JSON array")
+
+    if not data:
+        raise ValueError("response array is empty")
+
+    # Validate each entry
+    validated = []
+    for idx, item in enumerate(data):
+        if not isinstance(item, dict):
+            raise ValueError(f"item {idx} is not a dict")
+        sentence = str(item.get("sentence", "")).strip()
+        search_query = str(item.get("search_query", "")).strip()
+        visual_type = str(item.get("visual_type", "stock")).strip().lower()
+
+        if not sentence:
+            raise ValueError(f"item {idx} missing 'sentence'")
+        if not search_query:
+            raise ValueError(f"item {idx} missing 'search_query'")
+        if visual_type not in {"stock", "image", "canvas"}:
+            raise ValueError(
+                f"item {idx} has invalid visual_type '{visual_type}'. "
+                f"Must be one of: stock, image, canvas"
+            )
+
+        validated.append({
+            "sentence": sentence,
+            "search_query": search_query,
+            "visual_type": visual_type,
+        })
+
+    return validated
+
+
 # =============================================================================
 # Social publishing metadata
 #
@@ -1476,6 +1651,168 @@ def generate_social_metadata(
     logger.warning("falling back to heuristic social metadata")
     return _fallback_social_metadata(video_subject, video_script, platform)
 
+
+def _extract_embedded_json(text: str, delimiter: str = "[") -> list:
+    """
+    Extract the first balanced JSON array (or object) embedded in arbitrary text.
+
+    This handles cases where the LLM returns prose around a JSON block,
+    e.g. "Here is the output: [{...}]". We scan for the first occurrence
+    of the opening delimiter, then find its matching closing delimiter by
+    tracking bracket depth while respecting string escapes.
+
+    Args:
+        text: The full response text to search.
+        delimiter: The opening character to locate ('[' for arrays, '{' for objects).
+
+    Returns:
+        The parsed JSON value.
+
+    Raises:
+        ValueError: If no balanced JSON structure is found.
+    """
+    start = text.find(delimiter)
+    if start == -1:
+        raise ValueError(f"no '{delimiter}' found in response text")
+
+    closing = ']' if delimiter == '[' else '}'
+    depth = 0
+    in_string = False
+    escape_next = False
+
+    for i in range(start, len(text)):
+        ch = text[i]
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == '\\' and in_string:
+            escape_next = True
+            continue
+        if ch == '"' and not escape_next:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == delimiter:
+            depth += 1
+        elif ch == closing:
+            depth -= 1
+            if depth == 0:
+                candidate = text[start : i + 1]
+                return json.loads(candidate)
+
+    raise ValueError("unbalanced JSON: no matching closing delimiter found")
+
+
+
+# =============================================================================
+# Vision-based image/video quality checking (for stock material thumbnail validation)
+# =============================================================================
+
+# Default timeout for vision checking HTTP calls
+VISION_CHECK_TIMEOUT_SECONDS = 30.0
+# Default rate limit delay between successive vision model HTTP calls
+VISION_CHECK_RATE_LIMIT_SECONDS = 1.0
+
+# Prompt template for vision checking
+# Asks the LLM to evaluate whether an image/video matches a search query
+VISION_CHECK_PROMPT_TEMPLATE = """You are a visual content evaluator. Given an image URL and a search query, 
+determine if the image/video content matches the search query description.
+
+Image URL: {image_url}
+Search Query: {search_query}
+
+Respond with ONLY "YES" if the image/video clearly contains or depicts what the search query describes,
+or "NO" if it does not match, is unrelated, or is unclear.
+
+Do not provide any explanation, just the single word answer: YES or NO.
+"""
+
+
+def check_image_matches_query(
+    image_url: str,
+    search_query: str,
+    app_config=None,
+    timeout: float = VISION_CHECK_TIMEOUT_SECONDS,
+) -> str | None:
+    """
+    Use the LLM provider with vision capability to check if an image/video matches the search query.
+    
+    This function sends an image URL and search query to the LLM provider's vision model
+    and returns "YES" if the image matches, "NO" if it doesn't, or None if the check fails.
+    
+    Args:
+        image_url: URL of the image or video thumbnail to check
+        search_query: The search query to match against
+        app_config: Optional app config snapshot for consistent provider selection during retries
+        timeout: Timeout for the HTTP request in seconds
+        
+    Returns:
+        "YES" if image matches, "NO" if it doesn't, None on error or unexpected response
+    """
+    if not image_url or not search_query:
+        return None
+    
+    prompt = VISION_CHECK_PROMPT_TEMPLATE.format(
+        image_url=image_url,
+        search_query=search_query
+    )
+    
+    try:
+        response = _generate_response(prompt, app_config=app_config, request_timeout=timeout)
+        
+        if isinstance(response, str) and response.startswith("Error: "):
+            logger.error(f"vision check failed: {response}")
+            return None
+        
+        if not response:
+            return None
+        
+        # Clean the response - strip whitespace and code fences
+        cleaned = _strip_code_fence(response.strip())
+        
+        # Extract the answer - should be "YES" or "NO"
+        answer = cleaned.upper().strip()
+        
+        # Handle various response formats
+        if answer in ("YES", "NO"):
+            return answer
+        
+        # Try to extract YES/NO from a longer response
+        if "YES" in answer and "NO" not in answer:
+            return "YES"
+        if "NO" in answer and "YES" not in answer:
+            return "NO"
+            
+        logger.warning(f"vision check returned unexpected response: {answer}")
+        return None
+        
+    except Exception as e:
+        logger.warning(f"vision check exception: {type(e).__name__}: {e}")
+        return None
+
+
+def _rate_limit_vision_check(last_check_time: float | None) -> float:
+    """
+    Implement rate limiting between vision check HTTP calls.
+    
+    Returns the current time, ensuring a minimum delay between calls.
+    
+    Args:
+        last_check_time: The timestamp of the last vision check, or None if this is the first
+        
+    Returns:
+        The current timestamp after any necessary delay
+    """
+    current_time = time.time()
+    if last_check_time is not None:
+        elapsed = current_time - last_check_time
+        if elapsed < VISION_CHECK_RATE_LIMIT_SECONDS:
+            delay = VISION_CHECK_RATE_LIMIT_SECONDS - elapsed
+            logger.debug(f"rate limiting vision check: sleeping {delay:.2f}s")
+            time.sleep(delay)
+            return time.time()
+    return current_time
 
 if __name__ == "__main__":
     video_subject = "生命的意义是什么"

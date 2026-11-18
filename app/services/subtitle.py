@@ -16,9 +16,54 @@ from app.utils import utils
 from app.utils.subtitle_reader import file_to_subtitles as file_to_subtitles
 from app.utils.subtitle_writer import write_subtitle_file
 
+
+def _resolve_whisper_device_and_compute_type() -> tuple[str, str]:
+    """
+    Resolve the Whisper device and compute_type from config.
+
+    Supports "auto" for automatic CUDA detection with sensible defaults:
+    - CUDA available: device="cuda", compute_type="float16" (optimal for RTX 3050)
+    - CUDA not available: device="cpu", compute_type="int8"
+
+    Returns (device, compute_type) tuple.
+    """
+    configured_device = str(config.whisper.get("device", "auto") or "auto").strip().lower()
+    configured_compute = str(config.whisper.get("compute_type", "auto") or "auto").strip().lower()
+
+    # Auto-detect CUDA availability
+    cuda_available = False
+    try:
+        import torch
+        cuda_available = torch.cuda.is_available()
+    except ImportError:
+        pass  # torch not installed, assume no CUDA
+
+    if configured_device == "auto":
+        device = "cuda" if cuda_available else "cpu"
+    else:
+        device = configured_device  # "cpu" or "cuda"
+
+    if configured_compute == "auto":
+        if device == "cuda":
+            compute_type = "float16"  # Optimal for RTX 3050 (4-8GB VRAM)
+        else:
+            compute_type = "int8"  # Fastest on CPU
+    else:
+        compute_type = configured_compute
+
+    # Validate compute_type for device
+    if device == "cpu" and compute_type in ("float16",):
+        logger.warning(f"compute_type '{compute_type}' not supported on CPU, falling back to 'int8'")
+        compute_type = "int8"
+    if device == "cuda" and compute_type not in ("float16", "int8_float16", "int8", "float32"):
+        logger.warning(f"compute_type '{compute_type}' may not be optimal for CUDA, using 'float16'")
+        compute_type = "float16"
+
+    return device, compute_type
+
+
 model_size = config.whisper.get("model_size", "large-v3")
-device = config.whisper.get("device", "cpu")
-compute_type = config.whisper.get("compute_type", "int8")
+device, compute_type = _resolve_whisper_device_and_compute_type()
 initial_prompt = config.whisper.get("initial_prompt", "") or None
 model = None
 _model_init_lock = threading.Lock()

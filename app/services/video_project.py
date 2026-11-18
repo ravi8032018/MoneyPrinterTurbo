@@ -22,6 +22,9 @@ import time
 from typing import Callable, Iterator
 from uuid import uuid4
 
+from loguru import logger
+from app.services.video import get_best_video_codec
+
 PREPARED_FORMATS = "mov,matroska,avi,mpegts,mpegvideo,ogg,flv,wav,mp3,flac,aac"
 SCHEMA_VERSION = 1
 RENDERER_VERSION = "local-ffmpeg-v1"
@@ -726,9 +729,9 @@ class VideoProject:
                     "duration"
                 ]
                 vf = f"scale={settings.width}:{settings.height}:force_original_aspect_ratio=increase,crop={settings.width}:{settings.height},setsar=1,fps={settings.fps}"
-                self._run(
-                    base
-                    + [
+
+                def build_scene_cmd(codec: str, preset: str) -> list[str]:
+                    return base + [
                         "-stream_loop",
                         "-1",
                         "-format_whitelist",
@@ -746,9 +749,9 @@ class VideoProject:
                         "-t",
                         str(duration),
                         "-c:v",
-                        "libx264",
+                        codec,
                         "-preset",
-                        "veryfast",
+                        preset,
                         "-pix_fmt",
                         "yuv420p",
                         "-c:a",
@@ -760,10 +763,25 @@ class VideoProject:
                         "-movflags",
                         "+faststart",
                         str(output),
-                    ],
-                    cancel,
-                    timeout,
-                )
+                    ]
+
+                # Use hardware encoder for scene rendering with fallback to libx264
+                codec = get_best_video_codec()
+                preset = "p3" if codec == "h264_nvenc" else "veryfast"
+                try:
+                    self._run(build_scene_cmd(codec, preset), cancel, timeout)
+                except ProjectError as exc:
+                    # If hardware encoder fails, fall back to libx264
+                    if codec != "libx264" and "h264_nvenc" in str(exc):
+                        logger.warning(
+                            f"Hardware encoder {codec} failed for scene {scene['id']}, "
+                            f"falling back to libx264: {exc}"
+                        )
+                        fallback_codec = "libx264"
+                        fallback_preset = "veryfast"
+                        self._run(build_scene_cmd(fallback_codec, fallback_preset), cancel, timeout)
+                    else:
+                        raise
             elif stage.kind == "assembly":
                 # Relative numeric links avoid concat syntax/path injection, including apostrophes.
                 for index, scene_spec in enumerate(spec["scenes"]):

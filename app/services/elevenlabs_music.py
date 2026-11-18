@@ -220,6 +220,10 @@ def _create_video_proxy(video_path: str) -> str:
         dir=os.path.dirname(os.path.abspath(video_path)),
     )
     os.close(descriptor)
+    from app.services.video import get_best_video_codec
+    codec = get_best_video_codec()
+    # NVENC preset mapping: p1=slow, p2=medium, p3=fast, p4=veryfast (closest to veryfast)
+    preset = "p3" if codec == "h264_nvenc" else "veryfast"
     command = [
         utils.get_ffmpeg_binary(),
         "-nostdin",
@@ -235,9 +239,9 @@ def _create_video_proxy(video_path: str) -> str:
         ),
         "-an",
         "-c:v",
-        "libx264",
+        codec,
         "-preset",
-        "veryfast",
+        preset,
         "-crf",
         "30",
         "-pix_fmt",

@@ -95,7 +95,7 @@ class TestConfigPersistence:
             "music_model_id": "music_v2",
             "music_timeout": 600,
         }
-        assert example_config["whisper"]["device"] == "cpu"
+        assert example_config["whisper"]["device"] == "auto"
 
     def test_example_config_covers_llm_provider_registry(self):
         """Registry 中可配置的 Provider 字段必须能在示例文件中被发现。"""

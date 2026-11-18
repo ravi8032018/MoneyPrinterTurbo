@@ -9,6 +9,7 @@ import time
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from functools import partial
 from os import path
+from typing import List
 from uuid import uuid4
 
 from loguru import logger
@@ -429,13 +430,40 @@ def generate_terms(task_id, params, video_script):
     return video_terms
 
 
-def save_script_data(task_id, video_script, video_terms, params):
+def save_script_data(task_id, video_script, video_terms, params, scenes=None):
     script_data = {
         "script": video_script,
         "search_terms": video_terms,
         "params": params,
+        "scenes": scenes,
     }
     task_artifacts.write_script_data(task_id, script_data)
+
+
+def generate_scenes(task_id, params, video_script):
+    """Generate sentence-by-sentence scene mappings with visual type hints."""
+    logger.info("\n\n## generating scenes")
+
+    if not video_script:
+        _mark_task_failed(task_id, "script", "failed to generate video script")
+        return None
+
+    scenes = llm.generate_scenes(
+        video_subject=params.video_subject,
+        video_script=utils.remove_pause_tags(video_script),
+        amount=8 if params.match_materials_to_script else 5,
+    )
+
+    if not scenes:
+        _mark_task_failed(
+            task_id,
+            "scenes",
+            "failed to generate scene mappings",
+        )
+        return None
+
+    logger.info(f"generated {len(scenes)} scene mappings")
+    return scenes
 
 
 def resolve_custom_audio_file(
@@ -733,6 +761,7 @@ def get_video_materials(
     params,
     video_terms,
     audio_duration,
+    scenes: List[dict] | None = None,
     loomloom_video_request: loomloom.LoomLoomConfirmedVideoRequest | None = None,
     jalapeno_video_endpoint: volcengine_seedance.SeedanceEndpoint | None = None,
     codex_image_context: codex_image.CodexImageContext | None = None,
@@ -823,138 +852,200 @@ def get_video_materials(
         )
         if params.video_source == "codex_image":
             generation_options["codex_image_context"] = codex_image_context
-        # 顺序匹配模式只在用户显式开启时生效。这里强制素材下载按关键词顺序
-        # 轮询，避免某个早期关键词下载太多素材，把后续脚本主题挤出最终时间线。
-        try:
-            downloaded_videos = material.download_videos(
-                task_id=task_id,
-                search_terms=video_terms,
-                source=params.video_source,
-                video_aspect=params.video_aspect,
-                video_concat_mode=(
-                    VideoConcatMode.sequential
-                    if params.match_materials_to_script
-                    else params.video_concat_mode
-                ),
-                audio_duration=audio_duration * params.video_count,
-                max_clip_duration=params.video_clip_duration,
-                clip_speed=params.video_clip_speed,
-                match_script_order=params.match_materials_to_script,
-                image_motion=params.image_motion,
-                # 素材阶段占用 40%~50%：每下完一个文件推进一次，慢速网络下
-                # 进度条不再长时间停在 40%。
-                progress_callback=_stage_progress_reporter(task_id, 40, 50),
-                **generation_options,
-            )
-        except volcengine_seedance.VolcEngineSeedanceError as exc:
-            # 未确认状态和已生成但下载失败都对应一个可在方舟控制台恢复的远端
-            # 任务。统一从异常携带的 task_id 写入失败状态，避免不同异常分支
-            # 各自维护恢复信息并在后续扩展时再次遗漏。
-            remote_task_id = str(getattr(exc, "task_id", "") or "").strip()
-            details = (
-                {("jalapeno_task_id" if params.video_source == "jalapeno"
-                  else "volcengine_seedance_task_id"): remote_task_id}
-                if remote_task_id
-                else None
-            )
-            _mark_task_failed(
-                task_id,
-                "materials",
-                str(exc),
-                details=details,
-            )
-            return None
-        except (
-            material.WaveSpeedUnconfirmedTaskError,
-            material.WaveSpeedDownloadError,
-        ) as exc:
-            # Once a paid prediction exists, a polling or download failure must
-            # leave its ID in task state. Earlier successful clips cannot turn
-            # this incomplete run into an apparently completed video task.
-            prediction_id = str(getattr(exc, "prediction_id", "") or "").strip()
-            details = {"wavespeed_prediction_id": prediction_id} if prediction_id else None
-            _mark_task_failed(task_id, "materials", str(exc), details=details)
-            return None
-        except material.OpenAIImagePaidResultError as exc:
-            # A paid request with an uncertain response, failed result download,
-            # or failed local render must stop before another image order.
-            details = (
-                {"error_key": exc.key, "error_params": exc.params}
-                if isinstance(exc, material.CodexImageMaterialError)
-                else None
-            )
-            _mark_task_failed(task_id, "materials", str(exc), details=details)
-            return None
-        except ofox.OFoxError as exc:
-            # 与方舟同一恢复语义：未确认状态和已生成但下载失败都对应一个可在
-            # OFox 控制台恢复的远端任务，统一从异常携带的 task_id 写入失败状态。
-            remote_task_id = str(getattr(exc, "task_id", "") or "").strip()
-            details = (
-                {"ofox_task_id": remote_task_id} if remote_task_id else None
-            )
-            _mark_task_failed(
-                task_id,
-                "materials",
-                str(exc),
-                details=details,
-            )
-            return None
-        except metaso_minimax.MetasoMiniMaxError as exc:
-            # 秘塔任务与方舟任务使用不同的恢复入口和字段名，不能合并成一个
-            # 模糊的 remote_task_id。保留明确 Provider 前缀便于 API、WebUI
-            # 和运维日志直接定位对应平台。
-            remote_task_id = str(getattr(exc, "task_id", "") or "").strip()
-            details = (
-                {"metaso_minimax_task_id": remote_task_id} if remote_task_id else None
-            )
-            _mark_task_failed(
-                task_id,
-                "materials",
-                str(exc),
-                details=details,
-            )
-            return None
-        except infistar_video.InfistarVideoError as exc:
-            remote_task_id = str(exc.task_id or "").strip()
-            _mark_task_failed(
-                task_id, "materials", str(exc),
-                details={"infistar_task_id": remote_task_id} if remote_task_id else None,
-            )
-            return None
-        except muapi.MuAPIError as exc:
-            # MuAPI tasks are billable after acceptance.  Preserve the remote
-            # request ID on any ambiguous or post-completion failure so the
-            # user can recover it from the provider dashboard.
-            remote_task_id = str(getattr(exc, "task_id", "") or "").strip()
-            details = {"muapi_task_id": remote_task_id} if remote_task_id else None
-            _mark_task_failed(
-                task_id,
-                "materials",
-                str(exc),
-                details=details,
-            )
-            return None
-        except useapi.UseAPIError as exc:
-            # useapi.net jobs spend credits on the user's own account once they
-            # start. Keep the job ID on an unconfirmed or post-completion
-            # failure so the user can look it up with GET /jobs on useapi.net.
-            remote_task_id = str(getattr(exc, "task_id", "") or "").strip()
-            details = {"useapi_job_id": remote_task_id} if remote_task_id else None
-            _mark_task_failed(
-                task_id,
-                "materials",
-                str(exc),
-                details=details,
-            )
-            return None
-        if not downloaded_videos:
-            _mark_task_failed(
-                task_id,
-                "materials",
-                f"failed to download video materials from {params.video_source}",
-            )
-            return None
-        return downloaded_videos
+
+        # Use scene-based download if scenes are provided
+        if scenes:
+            try:
+                downloaded_videos = material.download_scenes(
+                    task_id=task_id,
+                    scenes=scenes,
+                    source=params.video_source,
+                    video_aspect=params.video_aspect,
+                    audio_duration=audio_duration * params.video_count,
+                    max_clip_duration=params.video_clip_duration,
+                    clip_speed=params.video_clip_speed,
+                    match_script_order=True,
+                    image_motion=params.image_motion,
+                    progress_callback=_stage_progress_reporter(task_id, 40, 50),
+                    **generation_options,
+                )
+            except (
+                material.WaveSpeedUnconfirmedTaskError,
+                material.WaveSpeedDownloadError,
+                volcengine_seedance.VolcEngineSeedanceError,
+            ) as exc:
+                _mark_task_failed(
+                    task_id,
+                    "materials",
+                    str(exc),
+                    details={
+                        ("jalapeno_task_id" if params.video_source == "jalapeno"
+                         else "volcengine_seedance_task_id"): getattr(exc, "task_id", None)
+                    } if getattr(exc, "task_id", None) else None,
+                )
+                return None
+            except material.OpenAIImagePaidResultError as exc:
+                details = {
+                    "error_key": exc.key, "error_params": exc.params
+                } if isinstance(exc, material.CodexImageMaterialError) else None
+                _mark_task_failed(task_id, "materials", str(exc), details=details)
+                return None
+            except (
+                loomloom.LoomLoomError,
+                material.OFoxError,
+                muapi.MuAPIError,
+                infistar_video.InfistarVideoError,
+                ofox.OFoxError,
+            ) as exc:
+                _mark_task_failed(
+                    task_id,
+                    "materials",
+                    str(exc),
+                    details={"remote_task_id": getattr(exc, "task_id", None)}
+                    if getattr(exc, "task_id", None) else None,
+                )
+                return None
+            except Exception as exc:
+                logger.error(f"scene download error: {type(exc).__name__}: {exc}")
+                _mark_task_failed(
+                    task_id,
+                    "materials",
+                    f"scene-based material download failed: {exc}",
+                )
+                return None
+        else:
+            # 顺序匹配模式只在用户显式开启时生效。这里强制素材下载按关键词顺序
+            # 轮询，避免某个早期关键词下载太多素材，把后续脚本主题挤出最终时间线。
+            try:
+                downloaded_videos = material.download_videos(
+                    task_id=task_id,
+                    search_terms=video_terms,
+                    source=params.video_source,
+                    video_aspect=params.video_aspect,
+                    video_concat_mode=(
+                        VideoConcatMode.sequential
+                        if params.match_materials_to_script
+                        else params.video_concat_mode
+                    ),
+                    audio_duration=audio_duration * params.video_count,
+                    max_clip_duration=params.video_clip_duration,
+                    clip_speed=params.video_clip_speed,
+                    match_script_order=params.match_materials_to_script,
+                    image_motion=params.image_motion,
+                    # 素材阶段占用 40%~50%：每下完一个文件推进一次，慢速网络下
+                    # 进度条不再长时间停在 40%。
+                    progress_callback=_stage_progress_reporter(task_id, 40, 50),
+                    **generation_options,
+                )
+            except volcengine_seedance.VolcEngineSeedanceError as exc:
+                # 未确认状态和已生成但下载失败都对应一个可在方舟控制台恢复的远端
+                # 任务。统一从异常携带的 task_id 写入失败状态，避免不同异常分支
+                # 各自维护恢复信息并在后续扩展时再次遗漏。
+                remote_task_id = str(getattr(exc, "task_id", "") or "").strip()
+                details = (
+                    {("jalapeno_task_id" if params.video_source == "jalapeno"
+                      else "volcengine_seedance_task_id"): remote_task_id}
+                    if remote_task_id
+                    else None
+                )
+                _mark_task_failed(
+                    task_id,
+                    "materials",
+                    str(exc),
+                    details=details,
+                )
+                return None
+            except (
+                material.WaveSpeedUnconfirmedTaskError,
+                material.WaveSpeedDownloadError,
+            ) as exc:
+                # Once a paid prediction exists, a polling or download failure must
+                # leave its ID in task state. Earlier successful clips cannot turn
+                # this incomplete run into an apparently completed video task.
+                prediction_id = str(getattr(exc, "prediction_id", "") or "").strip()
+                details = {"wavespeed_prediction_id": prediction_id} if prediction_id else None
+                _mark_task_failed(task_id, "materials", str(exc), details=details)
+                return None
+            except material.OpenAIImagePaidResultError as exc:
+                # A paid request with an uncertain response, failed result download,
+                # or failed local render must stop before another image order.
+                details = (
+                    {"error_key": exc.key, "error_params": exc.params}
+                    if isinstance(exc, material.CodexImageMaterialError)
+                    else None
+                )
+                _mark_task_failed(task_id, "materials", str(exc), details=details)
+                return None
+            except ofox.OFoxError as exc:
+                # 与方舟同一恢复语义：未确认状态和已生成但下载失败都对应一个可在
+                # OFox 控制台恢复的远端任务，统一从异常携带的 task_id 写入失败状态。
+                remote_task_id = str(getattr(exc, "task_id", "") or "").strip()
+                details = (
+                    {"ofox_task_id": remote_task_id} if remote_task_id else None
+                )
+                _mark_task_failed(
+                    task_id,
+                    "materials",
+                    str(exc),
+                    details=details,
+                )
+                return None
+            except metaso_minimax.MetasoMiniMaxError as exc:
+                # 秘塔任务与方舟任务使用不同的恢复入口和字段名，不能合并成一个
+                # 模糊的 remote_task_id。保留明确 Provider 前缀便于 API、WebUI
+                # 和运维日志直接定位对应平台。
+                remote_task_id = str(getattr(exc, "task_id", "") or "").strip()
+                details = (
+                    {"metaso_minimax_task_id": remote_task_id} if remote_task_id else None
+                )
+                _mark_task_failed(
+                    task_id,
+                    "materials",
+                    str(exc),
+                    details=details,
+                )
+                return None
+            except infistar_video.InfistarVideoError as exc:
+                remote_task_id = str(exc.task_id or "").strip()
+                _mark_task_failed(
+                    task_id, "materials", str(exc),
+                    details={"infistar_task_id": remote_task_id} if remote_task_id else None,
+                )
+                return None
+            except muapi.MuAPIError as exc:
+                # MuAPI tasks are billable after acceptance.  Preserve the remote
+                # request ID on any ambiguous or post-completion failure so the
+                # user can recover it from the provider dashboard.
+                remote_task_id = str(getattr(exc, "task_id", "") or "").strip()
+                details = {"muapi_task_id": remote_task_id} if remote_task_id else None
+                _mark_task_failed(
+                    task_id,
+                    "materials",
+                    str(exc),
+                    details=details,
+                )
+                return None
+            except useapi.UseAPIError as exc:
+                # useapi.net jobs spend credits on the user's own account once they
+                # start. Keep the job ID on an unconfirmed or post-completion
+                # failure so the user can look it up with GET /jobs on useapi.net.
+                remote_task_id = str(getattr(exc, "task_id", "") or "").strip()
+                details = {"useapi_job_id": remote_task_id} if remote_task_id else None
+                _mark_task_failed(
+                    task_id,
+                    "materials",
+                    str(exc),
+                    details=details,
+                )
+                return None
+            if not downloaded_videos:
+                _mark_task_failed(
+                    task_id,
+                    "materials",
+                    f"failed to download video materials from {params.video_source}",
+                )
+                return None
+            return downloaded_videos
 
 
 def _record_loomloom_run_reference(
@@ -1788,18 +1879,37 @@ def _run_pipeline(
         return {"script": video_script}
 
     generation_progress.stage("terms")
-    # 2. Generate terms
+    # 2. Generate terms (and scenes for script-order mode)
     video_terms = ""
+    scenes = None
     if stop_at in {"terms", "materials", "video"} and params.video_source != "local":
-        video_terms = generate_terms(task_id, params, video_script)
-        if not video_terms:
-            return _mark_task_failed(
-                task_id,
-                "terms",
-                "failed to generate video search terms",
-            )
+        # Use scene-based generation if script-order matching is enabled
+        if params.match_materials_to_script:
+            scenes = generate_scenes(task_id, params, video_script)
+            if scenes:
+                # Extract search terms from scenes for backward compatibility
+                video_terms = llm.generate_terms(
+                    video_subject=params.video_subject,
+                    video_script=utils.remove_pause_tags(video_script),
+                    amount=len(scenes),
+                    match_script_order=True,
+                )
+            else:
+                return _mark_task_failed(
+                    task_id,
+                    "scenes",
+                    "failed to generate scene mappings",
+                )
+        else:
+            video_terms = generate_terms(task_id, params, video_script)
+            if not video_terms:
+                return _mark_task_failed(
+                    task_id,
+                    "terms",
+                    "failed to generate video search terms",
+                )
 
-    save_script_data(task_id, video_script, video_terms, params)
+    save_script_data(task_id, video_script, video_terms, params, scenes)
 
     if stop_at == "terms":
         sm.state.update_task(
@@ -1894,6 +2004,7 @@ def _run_pipeline(
         params,
         video_terms,
         audio_duration,
+        scenes=scenes,
         loomloom_video_request=loomloom_video_request,
         **({"codex_image_context": codex_image_context}
            if codex_image_context is not None else {}),

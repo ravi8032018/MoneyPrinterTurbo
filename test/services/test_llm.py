@@ -2925,5 +2925,104 @@ class TestRetryWarningBoundary(unittest.TestCase):
         )
 
 
+class TestSceneParsing(unittest.TestCase):
+    """Tests for the _parse_scenes_response and generate_scenes functions."""
+
+    def test_parse_pure_json_array_succeeds(self):
+        """Pure JSON array should parse correctly."""
+        response = '''[
+            {"sentence": "Coffee beans are roasted.", "search_query": "roasted coffee beans", "visual_type": "stock"},
+            {"sentence": "They are brewed.", "search_query": "coffee brewing process", "visual_type": "image"}
+        ]'''
+        result = llm._parse_scenes_response(response)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["sentence"], "Coffee beans are roasted.")
+        self.assertEqual(result[0]["search_query"], "roasted coffee beans")
+        self.assertEqual(result[0]["visual_type"], "stock")
+        self.assertEqual(result[1]["visual_type"], "image")
+
+    def test_parse_json_with_markdown_fences_succeeds(self):
+        """JSON wrapped in markdown code fences should be stripped."""
+        response = '''```json
+[
+    {"sentence": "Hello world.", "search_query": "hello greeting", "visual_type": "stock"}
+]
+```'''
+        result = llm._parse_scenes_response(response)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["sentence"], "Hello world.")
+
+    def test_parse_json_with_extra_whitespace_succeeds(self):
+        """JSON with leading/trailing whitespace should be handled."""
+        response = '''   [
+    {"sentence": "Test.", "search_query": "test scene", "visual_type": "image"}
+]   '''
+        result = llm._parse_scenes_response(response)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["sentence"], "Test.")
+
+    def test_parse_json_with_extra_prose_fails_gracefully(self):
+        """JSON embedded in prose should be extracted."""
+        response = '''Here is the output:
+[
+    {"sentence": "Scene one.", "search_query": "scene one view", "visual_type": "stock"}
+]
+End of response.'''
+        result = llm._parse_scenes_response(response)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["sentence"], "Scene one.")
+
+    def test_parse_invalid_json_raises_value_error(self):
+        """Invalid JSON should raise ValueError."""
+        response = '''not valid json'''
+        with self.assertRaises(ValueError):
+            llm._parse_scenes_response(response)
+
+    def test_parse_missing_sentence_raises_value_error(self):
+        """Missing sentence field should raise ValueError."""
+        response = '''[{"search_query": "test", "visual_type": "stock"}]'''
+        with self.assertRaises(ValueError) as ctx:
+            llm._parse_scenes_response(response)
+        self.assertIn("sentence", str(ctx.exception))
+
+    def test_parse_missing_search_query_raises_value_error(self):
+        """Missing search_query field should raise ValueError."""
+        response = '''[{"sentence": "Test.", "visual_type": "stock"}]'''
+        with self.assertRaises(ValueError) as ctx:
+            llm._parse_scenes_response(response)
+        self.assertIn("search_query", str(ctx.exception))
+
+    def test_parse_invalid_visual_type_raises_value_error(self):
+        """Invalid visual_type should raise ValueError."""
+        response = '''[{"sentence": "Test.", "search_query": "test", "visual_type": "video"}]'''
+        with self.assertRaises(ValueError) as ctx:
+            llm._parse_scenes_response(response)
+        self.assertIn("visual_type", str(ctx.exception))
+
+    def test_parse_empty_array_raises_value_error(self):
+        """Empty JSON array should raise ValueError."""
+        response = "[]"
+        with self.assertRaises(ValueError):
+            llm._parse_scenes_response(response)
+
+    def test_visual_type_case_normalization(self):
+        """Visual type should be normalized to lowercase."""
+        response = '''[{"sentence": "Test.", "search_query": "test", "visual_type": "STOCK"}]'''
+        result = llm._parse_scenes_response(response)
+        self.assertEqual(result[0]["visual_type"], "stock")
+
+    def test_visual_type_with_whitespace_normalized(self):
+        """Visual type with whitespace should be normalized."""
+        response = '''[{"sentence": "Test.", "search_query": "test", "visual_type": "  IMAGE  "}]'''
+        result = llm._parse_scenes_response(response)
+        self.assertEqual(result[0]["visual_type"], "image")
+
+    def test_parse_non_array_json_raises_value_error(self):
+        """Non-array JSON should raise ValueError."""
+        response = '''{"sentence": "Test.", "search_query": "test", "visual_type": "stock"}'''
+        with self.assertRaises(ValueError):
+            llm._parse_scenes_response(response)
+
+
 if __name__ == "__main__":
     unittest.main()

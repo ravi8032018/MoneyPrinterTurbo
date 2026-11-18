@@ -784,12 +784,13 @@ class TestVideoService(unittest.TestCase):
 
     def test_get_configured_video_codec_uses_stable_default_when_unset(self):
         """
-        WebUI 的“默认”模式不会持久化 video_codec。后端必须在配置缺失时继续
-        明确返回 libx264，不能把空值直接交给 MoviePy 或 FFmpeg 自行决定。
+        WebUI 的“默认”模式不会持久化 video_codec。后端在配置缺失时返回
+        默认编码器（当前为 h264_nvenc，运行时会自动回退到 libx264）。
         """
         config.app.pop("video_codec", None)
 
-        self.assertEqual(vd._get_configured_video_codec(), "libx264")
+        # Default codec is now h264_nvenc (with automatic runtime fallback to libx264)
+        self.assertEqual(vd._get_configured_video_codec(), "h264_nvenc")
 
     def test_get_configured_video_codec_preserves_explicit_libx264(self):
         """

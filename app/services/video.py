@@ -99,7 +99,15 @@ def _get_clip_processing_concurrency() -> int:
     except (TypeError, ValueError):
         concurrency = _CLIP_PROCESSING_CONCURRENCY
     return max(1, min(8, concurrency))
-_DEFAULT_VIDEO_CODEC = "libx264"
+# Default to NVENC for RTX 3050 hardware acceleration, with automatic CPU fallback.
+# The effective codec is resolved at runtime via _get_effective_video_codec() which
+# checks FFmpeg encoder availability and runtime failures.
+# Default to NVENC for RTX 3050 hardware acceleration, with automatic CPU fallback.
+# The effective codec is resolved at runtime via _get_effective_video_codec() which
+# checks FFmpeg encoder availability and runtime failures.
+_DEFAULT_VIDEO_CODEC = "h264_nvenc"
+# Ultimate fallback codec (CPU) used when hardware encoding fails.
+_FALLBACK_VIDEO_CODEC = "libx264"
 # ffmpeg 串联片段期间没有阶段日志，`subprocess.run` 又阻塞到进程退出，耗时拼接在
 # 日志上表现为“无输出”。这里按间隔记录存活信息，便于区分编码中与已经卡死。
 _FFMPEG_CONCAT_HEARTBEAT_SECONDS = 30.0
@@ -369,34 +377,51 @@ def _get_effective_video_codec(preferred_codec: str | None = None) -> str:
     用户选择硬件编码器时，先做 FFmpeg encoder 列表检测；如果本进程里已经
     实际编码失败过，也直接回退，避免一个任务里每个片段都重复失败。
     """
+    # Check if user explicitly configured a codec (not using default)
+    explicit_config = config.app.get("video_codec") is not None
     selected_codec = preferred_codec or _get_configured_video_codec()
-    if selected_codec == _DEFAULT_VIDEO_CODEC:
+    
+    # If using the default codec (no explicit user choice), skip encoder checks
+    # and let runtime fallback handle any issues.
+    if not explicit_config and not preferred_codec and selected_codec == _DEFAULT_VIDEO_CODEC:
         return _DEFAULT_VIDEO_CODEC
 
     if selected_codec in _runtime_disabled_video_codecs:
         logger.warning(
             f"video codec {selected_codec} was disabled after a runtime failure, "
-            f"fallback to {_DEFAULT_VIDEO_CODEC}"
+            f"fallback to {_FALLBACK_VIDEO_CODEC}"
         )
-        return _DEFAULT_VIDEO_CODEC
+        return _FALLBACK_VIDEO_CODEC
 
     ffmpeg_binary = utils.get_ffmpeg_binary()
     if not _ffmpeg_encoder_exists(ffmpeg_binary, selected_codec):
         logger.warning(
             f"ffmpeg encoder {selected_codec} is not available, "
-            f"fallback to {_DEFAULT_VIDEO_CODEC}"
+            f"fallback to {_FALLBACK_VIDEO_CODEC}"
         )
-        return _DEFAULT_VIDEO_CODEC
+        return _FALLBACK_VIDEO_CODEC
 
     return selected_codec
 
 
+def get_best_video_codec() -> str:
+    """
+    Get the best available video codec for direct FFmpeg calls.
+
+    Returns the configured hardware encoder (NVENC/AMF/QSV) if available,
+    otherwise falls back to libx264. This is intended for direct FFmpeg
+    subprocess calls in material.py, sonilo.py, etc.
+    """
+    return _get_effective_video_codec()
+
+
 def _disable_runtime_video_codec(codec: str, reason: str):
-    if codec == _DEFAULT_VIDEO_CODEC:
+    # Don't disable the ultimate fallback codec (libx264)
+    if codec == _FALLBACK_VIDEO_CODEC:
         return
     _runtime_disabled_video_codecs.add(codec)
     logger.warning(
-        f"video codec {codec} failed, fallback to {_DEFAULT_VIDEO_CODEC}. "
+        f"video codec {codec} failed, fallback to {_FALLBACK_VIDEO_CODEC}. "
         f"reason: {reason}"
     )
 
@@ -427,9 +452,9 @@ def _fallback_write_videofile(clip, output_file: str, failed_codec: str, reason:
     文件被占用、目录权限、杀软拦截等通用 IO 问题。只有 libx264 能成功写出时，
     才能判断原始失败大概率来自硬件编码器本身，避免误伤后续任务。
     """
-    clip.write_videofile(output_file, codec=_DEFAULT_VIDEO_CODEC, **kwargs)
+    clip.write_videofile(output_file, codec=_FALLBACK_VIDEO_CODEC, **kwargs)
     _disable_runtime_video_codec(failed_codec, reason)
-    return _DEFAULT_VIDEO_CODEC
+    return _FALLBACK_VIDEO_CODEC
 
 
 def _write_videofile_with_codec_fallback(
@@ -475,7 +500,7 @@ def _write_videofile_with_codec_fallback(
         clip.write_videofile(output_file, codec=effective_codec, **kwargs)
         return effective_codec
     except Exception as exc:
-        if effective_codec == _DEFAULT_VIDEO_CODEC:
+        if effective_codec == _FALLBACK_VIDEO_CODEC:
             raise
         return _fallback_write_videofile(
             clip,
@@ -702,9 +727,9 @@ def concat_video_clips_with_ffmpeg(
             # not spend a second timeout period retrying the same input.
             raise
         except Exception as exc:
-            if effective_codec == _DEFAULT_VIDEO_CODEC:
+            if effective_codec == _FALLBACK_VIDEO_CODEC:
                 raise
-            result_codec = run_concat(_DEFAULT_VIDEO_CODEC)
+            result_codec = run_concat(_FALLBACK_VIDEO_CODEC)
             _disable_runtime_video_codec(effective_codec, str(exc))
         # Failed attempts and in-progress output stay private until FFmpeg has
         # finished. Publication errors must not trigger another codec attempt.

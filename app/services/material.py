@@ -28,6 +28,7 @@ from app.services import (
     generation_progress,
     infistar_video,
     jalapeno_video,
+    llm,
     material_cache,
     material_upload,
     metaso_minimax,
@@ -179,6 +180,38 @@ def _material_source_record(item: MaterialInfo, local_path: str) -> dict[str, An
         if rendition:
             record["rendition"] = rendition
     return record
+
+
+
+def _get_thumbnail_url(item: MaterialInfo) -> str | None:
+    """
+    Extract a thumbnail/preview URL from a MaterialInfo item for vision checking.
+    
+    Different providers have different URL structures:
+    - Pexels: item.source_info may contain 'rendition' with preview info
+    - Pixabay: item.source_info may contain 'rendition' with preview info  
+    - Coverr: item.source_info may contain preview URLs
+    
+    Falls back to the main video URL if no thumbnail is available.
+    """
+    if not isinstance(item.source_info, dict):
+        return item.url if item.url else None
+    
+    # Try to get preview/thumbnail from rendition info
+    rendition = item.source_info.get('rendition')
+    if isinstance(rendition, dict):
+        # Look for preview or thumbnail URLs
+        for key in ('preview', 'thumbnail', 'small', 'medium'):
+            if rendition.get(key):
+                return str(rendition[key])
+    
+    # Check for direct preview_url or thumbnail_url in source_info
+    for key in ('preview_url', 'thumbnail_url', 'preview', 'thumbnail'):
+        if item.source_info.get(key):
+            return str(item.source_info[key])
+    
+    # Fallback to main URL
+    return item.url if item.url else None
 
 
 def _persist_material_sources(
@@ -2130,6 +2163,428 @@ def _download_videos_openai_image_on_demand(
     return video_paths
 
 
+# =============================================================================
+# Phase 4: Hybrid AI Image Generation and Headless Canvas Animation Fallbacks
+# =============================================================================
+
+# FreeLLM API configuration
+FREELLM_IMAGE_ENDPOINT = "http://localhost:3001/v1/images/generations"
+FREELLM_IMAGE_DEFAULT_MODEL = "flux"
+FREELLM_IMAGE_MAX_ATTEMPTS = 3
+FREELLM_IMAGE_REQUEST_TIMEOUT = (30, 300)
+FREELLM_IMAGE_RETRY_BACKOFF_SECONDS = (5, 15, 30)
+
+# Canvas animation configuration
+CANVAS_RENDER_MAX_RETRIES = 2
+PLAYWRIGHT_LAUNCH_ARGS = [
+    "--enable-gpu", "--use-gl=angle", "--ignore-gpu-blocklist",
+    "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu-sandbox",
+]
+
+
+def is_freellm_image_enabled(app_config: dict | None = None) -> bool:
+    app_config = config.app if app_config is None else app_config
+    base_url = str(app_config.get("freellm_base_url", "") or "").strip()
+    if not base_url:
+        base_url = "http://localhost:3001"
+    return True
+
+
+def _freellm_image_endpoint(app_config: dict | None = None) -> tuple[str, str]:
+    app_config = config.app if app_config is None else app_config
+    base_url = str(app_config.get("freellm_base_url", "") or "").strip().rstrip("/")
+    if not base_url:
+        base_url = "http://localhost:3001"
+    model = str(app_config.get("freellm_image_model", "") or "").strip()
+    if not model:
+        model = FREELLM_IMAGE_DEFAULT_MODEL
+    return f"{base_url}/v1/images/generations", model
+
+
+def _freellm_image_size(video_aspect: VideoAspect) -> str:
+    configured = str(config.app.get("freellm_image_size", "") or "").strip()
+    if configured:
+        return configured
+    if video_aspect == VideoAspect.portrait:
+        return "1080x1920"
+    elif video_aspect == VideoAspect.landscape:
+        return "1920x1080"
+    return "1024x1024"
+
+
+def _freellm_image_prompt(search_term: str) -> str:
+    template = str(config.app.get("freellm_image_prompt_template", "") or "").strip()
+    if not template or "{term}" not in template:
+        return f"Cinematic illustration of {search_term}, highly detailed, 9:16 portrait aspect ratio, suitable for video background"
+    try:
+        return template.replace("{term}", search_term)
+    except Exception:
+        return f"Cinematic illustration of {search_term}, highly detailed, 9:16 portrait aspect ratio, suitable for video background"
+
+
+def generate_images_freellm(
+    search_term: str,
+    minimum_duration: int,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    save_dir: str = "",
+) -> List[MaterialInfo]:
+    """Generate an image using the local FreeLLM API (/images/generations endpoint)."""
+    aspect = VideoAspect(video_aspect)
+    clip_duration = max(int(minimum_duration), 1)
+    endpoint, model = _freellm_image_endpoint()
+    image_size = _freellm_image_size(aspect)
+    prompt = _freellm_image_prompt(search_term)
+    
+    payload = {"model": model, "prompt": prompt, "n": 1, "size": image_size, "response_format": "url"}
+    logger.info(f"generating image via FreeLLM endpoint: model={model}, term={search_term!r}, size={image_size}")
+    
+    api_keys = config.app.get("freellm_api_keys")
+    configured_keys = []
+    if isinstance(api_keys, (list, tuple)):
+        configured_keys = [k for k in api_keys if str(k or "").strip()]
+    
+    last_error = ""
+    for attempt in range(1, FREELLM_IMAGE_MAX_ATTEMPTS + 1):
+        api_key = ""
+        if configured_keys:
+            api_key = configured_keys[(attempt - 1) % len(configured_keys)]
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        try:
+            response = requests.post(endpoint, json=payload, headers=headers, timeout=FREELLM_IMAGE_REQUEST_TIMEOUT)
+        except requests.RequestException as exc:
+            last_error = f"request failed: {type(exc).__name__}: {exc}"
+            logger.warning(f"FreeLLM attempt {attempt}/{FREELLM_IMAGE_MAX_ATTEMPTS} failed: {last_error}")
+            if attempt < FREELLM_IMAGE_MAX_ATTEMPTS:
+                time.sleep(FREELLM_IMAGE_RETRY_BACKOFF_SECONDS[min(attempt - 1, len(FREELLM_IMAGE_RETRY_BACKOFF_SECONDS) - 1)])
+            continue
+        if response.status_code in {429, 500, 502, 503, 504}:
+            last_error = f"HTTP {response.status_code}: {response.text[:200]}"
+            logger.warning(f"FreeLLM attempt {attempt}/{FREELLM_IMAGE_MAX_ATTEMPTS} retryable: {last_error}")
+            if attempt < FREELLM_IMAGE_MAX_ATTEMPTS:
+                time.sleep(FREELLM_IMAGE_RETRY_BACKOFF_SECONDS[min(attempt - 1, len(FREELLM_IMAGE_RETRY_BACKOFF_SECONDS) - 1)])
+            continue
+        if response.status_code in {401, 403}:
+            last_error = f"HTTP {response.status_code}: authentication failed"
+            logger.error(f"FreeLLM authentication failed: {last_error}")
+            break
+        if not (200 <= response.status_code < 300):
+            last_error = f"HTTP {response.status_code}: {response.text[:300]}"
+            logger.error(f"FreeLLM image generation failed: {last_error}")
+            break
+        try:
+            data = response.json()
+        except Exception as exc:
+            last_error = f"invalid JSON response: {exc}"
+            logger.error(f"FreeLLM failed to parse response: {last_error}")
+            break
+        image_url = None
+        if isinstance(data, dict):
+            response_data = data.get("data")
+            if isinstance(response_data, list) and response_data:
+                first_item = response_data[0]
+                if isinstance(first_item, dict):
+                    image_url = first_item.get("url") or first_item.get("b64_json")
+        if not image_url:
+            last_error = "no image URL in response"
+            logger.error(f"FreeLLM image generation: {last_error}")
+            break
+        try:
+            img_response = requests.get(image_url, timeout=(10, 60))
+            img_response.raise_for_status()
+            image_bytes = img_response.content
+        except Exception as exc:
+            last_error = f"failed to download image: {exc}"
+            logger.error(f"FreeLLM image download failed: {last_error}")
+            if attempt < FREELLM_IMAGE_MAX_ATTEMPTS:
+                time.sleep(2)
+            continue
+        try:
+            image_path, width, height = _save_openai_image_file(image_bytes, save_dir)
+        except _OpenAIImageDecodeError as exc:
+            last_error = f"invalid image data: {exc}"
+            logger.error(f"FreeLLM generated image is not valid: {last_error}")
+            break
+        item = MaterialInfo()
+        item.provider = "freellm_image"
+        item.url = image_path
+        item.duration = clip_duration
+        item.source_info = {"provider": "freellm_image", "search_term": search_term, "rendition": {"id": None, "width": width, "height": height}}
+        logger.info(f"FreeLLM image generated and saved: {image_path} ({width}x{height})")
+        return [item]
+    
+    logger.error(f"FreeLLM image generation failed after {FREELLM_IMAGE_MAX_ATTEMPTS} attempts: term={search_term!r}, last_error={last_error}")
+    return []
+
+
+def apply_ken_burns_ffmpeg(
+    image_path: str, output_path: str, duration: float = 4.0,
+    zoom_start: float = 1.0, zoom_end: float = 1.25,
+) -> bool:
+    import subprocess
+    from app.services.video import get_best_video_codec
+    fps = 30
+    total_frames = int(duration * fps)
+    zoom_increment = (zoom_end - zoom_start) / total_frames
+    zoom_expr = f"min({zoom_start}+{zoom_increment}*on,{zoom_end})"
+    filter_complex = f"zoompan=z='{zoom_expr}':d={total_frames}:s=1080x1920:fps={fps},format=yuv420p"
+    codec = get_best_video_codec()
+    # NVENC prefers different preset names; use p4 (medium equivalent) for nvenc
+    preset = "p4" if codec == "h264_nvenc" else "medium"
+    cmd = ["ffmpeg", "-y", "-loop", "1", "-i", image_path, "-vf", filter_complex, "-t", str(duration),
+           "-c:v", codec, "-preset", preset, "-crf", "18", "-pix_fmt", "yuv420p", output_path]
+    try:
+        logger.debug(f"Running FFmpeg Ken Burns: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            logger.error(f"FFmpeg Ken Burns failed: {result.stderr}")
+            return False
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            logger.info(f"Ken Burns video created: {output_path}")
+            return True
+        logger.error("FFmpeg Ken Burns produced empty output")
+        return False
+    except subprocess.TimeoutExpired:
+        logger.error("FFmpeg Ken Burns timed out")
+        return False
+    except Exception as exc:
+        logger.error(f"FFmpeg Ken Burns exception: {type(exc).__name__}: {exc}")
+        return False
+
+
+def generate_canvas_animation_html(
+    sentence: str, search_query: str, duration: float,
+    width: int = 1080, height: int = 1920, app_config: dict | None = None,
+) -> str | None:
+    from app.services import llm
+    prompt = f"""Create a self-contained HTML5 Canvas animation (single HTML file) that visually represents: "{search_query}"
+
+Requirements:
+1. Single HTML file with embedded CSS and JavaScript (no external dependencies except CDN for Three.js if needed)
+2. Canvas size: {width}x{height} pixels (portrait 9:16)
+3. Animation duration: exactly {duration} seconds
+4. Must be visually appealing, smooth, and relevant to the search query
+5. Use requestAnimationFrame for smooth animation
+6. Include a timestamp-based animation loop that runs for exactly {duration} seconds
+7. At the end of animation, the page should signal completion (set window.animationComplete = true)
+8. No user interaction required - auto-play on load
+9. Handle errors gracefully - log to console but don't crash
+10. Clean, modern visual style suitable for video background
+
+The sentence context: "{sentence}"
+
+Return ONLY the complete HTML content, no markdown fences, no explanations.
+Start with <!DOCTYPE html> and end with </html>."""
+    try:
+        response = llm._generate_response(prompt, app_config=app_config, request_timeout=60.0)
+        if isinstance(response, str) and response.startswith("Error: "):
+            logger.error(f"Canvas animation generation failed: {response}")
+            return None
+        if not response:
+            return None
+        cleaned = response.strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.split("\n")
+            start_idx = 1
+            while start_idx < len(lines) and lines[start_idx].startswith("```"):
+                start_idx += 1
+            end_idx = len(lines) - 1
+            while end_idx > start_idx and lines[end_idx].startswith("```"):
+                end_idx -= 1
+            cleaned = "\n".join(lines[start_idx:end_idx+1])
+        if not cleaned.strip().startswith("<") or "<html" not in cleaned.lower():
+            logger.warning(f"Canvas animation response doesn't look like HTML: {cleaned[:200]}")
+            return None
+        logger.info(f"Generated canvas animation HTML for: {search_query[:50]}")
+        return cleaned
+    except Exception as exc:
+        logger.error(f"Canvas animation generation exception: {type(exc).__name__}: {exc}")
+        return None
+
+
+async def _render_canvas_animation_playwright(
+    html_content: str, output_path: str, duration: float,
+    width: int = 1080, height: int = 1920,
+) -> bool:
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        logger.error("Playwright not installed. Install with: pip install playwright && playwright install chromium")
+        return False
+    temp_html_path = output_path.replace(".mp4", ".html")
+    try:
+        with open(temp_html_path, "w", encoding="utf-8") as f:
+            f.write(html_content)
+    except Exception as exc:
+        logger.error(f"Failed to write temp HTML: {exc}")
+        return False
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, args=PLAYWRIGHT_LAUNCH_ARGS)
+            context = await browser.new_context(viewport={"width": width, "height": height}, device_scale_factor=1.0)
+            page = await context.new_page()
+            console_errors = []
+            page_errors = []
+            page.on("console", lambda msg: console_errors.append(msg.text) if msg.type == "error" else None)
+            page.on("pageerror", lambda exc: page_errors.append(str(exc)))
+            file_url = f"file://{os.path.abspath(temp_html_path)}"
+            await page.goto(file_url, wait_until="load", timeout=30000)
+            await page.wait_for_timeout(1000)
+            await page.video.start(path=output_path, size={"width": width, "height": height})
+            start_time = time.time()
+            animation_complete = False
+            while time.time() - start_time < (duration + 5):
+                try:
+                    animation_complete = await page.evaluate("() => window.animationComplete === true")
+                    if animation_complete:
+                        break
+                except Exception:
+                    pass
+                await page.wait_for_timeout(100)
+            await page.video.stop()
+            if page_errors:
+                logger.warning(f"Canvas animation page errors: {page_errors}")
+            if console_errors:
+                logger.warning(f"Canvas animation console errors: {console_errors}")
+            if not os.path.exists(output_path) or os.path.getsize(output_path) < 1024:
+                logger.error("Canvas animation recording produced no/empty video")
+                return False
+            logger.info(f"Canvas animation rendered successfully: {output_path}")
+            return True
+    except Exception as exc:
+        logger.error(f"Playwright canvas rendering failed: {type(exc).__name__}: {exc}")
+        return False
+    finally:
+        try:
+            if os.path.exists(temp_html_path):
+                os.remove(temp_html_path)
+        except Exception:
+            pass
+
+
+def render_canvas_animation(
+    sentence: str, search_query: str, duration: float, output_path: str,
+    width: int = 1080, height: int = 1920, app_config: dict | None = None,
+    max_retries: int = CANVAS_RENDER_MAX_RETRIES,
+) -> str | None:
+    import asyncio
+    for attempt in range(1, max_retries + 1):
+        logger.info(f"Canvas animation attempt {attempt}/{max_retries} for: {search_query[:50]}")
+        html_content = generate_canvas_animation_html(
+            sentence=sentence, search_query=search_query, duration=duration,
+            width=width, height=height, app_config=app_config,
+        )
+        if not html_content:
+            logger.warning(f"Canvas animation HTML generation failed (attempt {attempt})")
+            if attempt < max_retries:
+                time.sleep(2)
+            continue
+        try:
+            success = asyncio.run(_render_canvas_animation_playwright(
+                html_content=html_content, output_path=output_path,
+                duration=duration, width=width, height=height,
+            ))
+        except RuntimeError as exc:
+            logger.warning(f"Playwright event loop issue: {exc}, trying alternative")
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                success = loop.run_until_complete(_render_canvas_animation_playwright(
+                    html_content=html_content, output_path=output_path,
+                    duration=duration, width=width, height=height,
+                ))
+                loop.close()
+            except Exception as exc2:
+                logger.error(f"Playwright rendering failed: {exc2}")
+                success = False
+        except Exception as exc:
+            logger.error(f"Playwright rendering exception: {type(exc).__name__}: {exc}")
+            success = False
+        if success:
+            return output_path
+        logger.warning(f"Canvas animation rendering failed (attempt {attempt})")
+        if attempt < max_retries:
+            time.sleep(3)
+    logger.error(f"Canvas animation failed after {max_retries} attempts")
+    return None
+
+
+def process_scene_fallback(
+    scene: dict, task_id: str, video_aspect: VideoAspect,
+    max_clip_duration: int, material_directory: str,
+    image_motion: ImageMotion, app_config: dict | None = None,
+) -> str | None:
+    search_query = scene.get("search_query", "")
+    sentence = scene.get("sentence", "")
+    visual_type = scene.get("visual_type", "stock")
+    if not search_query:
+        logger.warning("Scene has no search query, cannot process fallback")
+        return None
+    aspect = VideoAspect(video_aspect)
+    clip_duration = max(int(max_clip_duration), 1)
+    if aspect == VideoAspect.portrait:
+        width, height = 1080, 1920
+    elif aspect == VideoAspect.landscape:
+        width, height = 1920, 1080
+    else:
+        width, height = 1080, 1080
+    import hashlib
+    scene_hash = hashlib.md5(f"{task_id}:{search_query}".encode()).hexdigest()[:12]
+    fallback_video = os.path.join(material_directory, f"fallback_{scene_hash}.mp4")
+    if visual_type == "canvas":
+        logger.info(f"Trying canvas animation fallback for scene: {search_query[:50]}")
+        result = render_canvas_animation(
+            sentence=sentence, search_query=search_query, duration=clip_duration,
+            output_path=fallback_video, width=width, height=height, app_config=app_config,
+        )
+        if result:
+            logger.success(f"Canvas animation fallback succeeded: {result}")
+            return result
+        logger.warning("Canvas animation fallback failed, trying AI image generation")
+    logger.info(f"Trying FreeLLM image generation fallback for scene: {search_query[:50]}")
+    items = generate_images_freellm(
+        search_term=search_query, minimum_duration=clip_duration,
+        video_aspect=aspect, save_dir=material_directory,
+    )
+    if items:
+        item = items[0]
+        ken_burns_output = fallback_video.replace(".mp4", "_kb.mp4")
+        if apply_ken_burns_ffmpeg(
+            image_path=item.url, output_path=ken_burns_output, duration=clip_duration,
+        ):
+            logger.success(f"FreeLLM + Ken Burns fallback succeeded: {ken_burns_output}")
+            return ken_burns_output
+        else:
+            logger.warning("FreeLLM image generated but Ken Burns FFmpeg failed, trying MoviePy render")
+            try:
+                rendered = video.render_image_zoom_video(item.url, clip_duration, image_motion=image_motion)
+                if rendered:
+                    logger.success(f"FreeLLM + MoviePy fallback succeeded: {rendered}")
+                    return rendered
+            except Exception as exc:
+                logger.error(f"MoviePy render also failed: {exc}")
+    else:
+        logger.warning("FreeLLM image generation failed")
+    if is_openai_image_enabled(app_config):
+        logger.info(f"Trying OpenAI-compatible image generation fallback for scene: {search_query[:50]}")
+        try:
+            items = generate_images_openai(
+                search_term=search_query, minimum_duration=clip_duration,
+                video_aspect=aspect, save_dir=material_directory,
+            )
+            if items:
+                item = items[0]
+                rendered = video.render_image_zoom_video(item.url, clip_duration, image_motion=image_motion)
+                if rendered:
+                    logger.success(f"OpenAI-compatible image fallback succeeded: {rendered}")
+                    return rendered
+        except Exception as exc:
+            logger.error(f"OpenAI-compatible image fallback failed: {exc}")
+    logger.error(f"All fallbacks failed for scene: {search_query[:50]}")
+    return None
+
+
 def _search_videos_with_cache(
     provider: str,
     search_videos: Callable[..., List[MaterialInfo]],
@@ -3610,3 +4065,241 @@ def _download_videos_infistar_on_demand(
     finally:
         _persist_material_sources(task_id, sources)
     return paths
+
+
+# =============================================================================
+# Scene-based video generation (sentence-by-sentence mapping)
+# =============================================================================
+
+def extract_search_terms_from_scenes(scenes: List[dict]) -> List[str]:
+    """
+    Extract search terms from scene mappings for backward compatibility.
+
+    Args:
+        scenes: List of dicts with 'search_query' key
+
+    Returns:
+        List of search query strings
+    """
+    if not scenes:
+        return []
+    terms = []
+    for scene in scenes:
+        if isinstance(scene, dict) and "search_query" in scene:
+            terms.append(scene["search_query"])
+    return terms
+
+
+def download_scenes(
+    task_id: str,
+    scenes: List[dict],
+    source: str = "pexels",
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    audio_duration: float = 0.0,
+    max_clip_duration: int = 5,
+    clip_speed: float = 1.0,
+    match_script_order: bool = False,
+    progress_callback: Callable[[float], None] | None = None,
+    image_motion: ImageMotion = ImageMotion.zoom,
+    jalapeno_video_endpoint=None,
+    codex_image_context=None,
+) -> List[str]:
+    """
+    Download video materials based on sentence-by-sentence scene mappings
+    with multi-API candidate pooling and vision-based quality checking.
+    """
+    if not scenes:
+        logger.warning("no scenes provided, cannot download materials")
+        return []
+
+    # Configuration for vision checking
+    max_candidates_per_source = 3
+    vision_check_timeout = llm.VISION_CHECK_TIMEOUT_SECONDS if hasattr(llm, 'VISION_CHECK_TIMEOUT_SECONDS') else 30.0
+    
+    # Determine which sources to use based on configuration
+    pexels_configured = bool(config.app.get("pexels_api_keys"))
+    pixabay_configured = bool(config.app.get("pixabay_api_keys"))
+    
+    if not pexels_configured and not pixabay_configured:
+        logger.warning("neither Pexels nor Pixabay API keys configured, falling back to default source")
+        pexels_configured = True  # Try anyway with default
+
+    # Extract search terms from scenes
+    search_terms = extract_search_terms_from_scenes(scenes)
+    if not search_terms:
+        logger.warning("no valid search terms found in scenes")
+        return []
+
+
+    # Prepare scene-specific search queries (each scene has its own search_query)
+    scene_queries = []
+    for scene in scenes:
+        if isinstance(scene, dict) and "search_query" in scene:
+            scene_queries.append(scene["search_query"])
+        else:
+            scene_queries.append("")
+
+    # For each scene, search both sources and apply vision checking
+    selected_videos = []
+    material_sources = []
+    total_duration = 0.0
+    last_vision_check_time = None
+    
+    material_directory = utils.task_dir(task_id)
+    on_downloaded = _covered_duration_reporter(
+        progress_callback, audio_duration, max_clip_duration, clip_speed
+    )
+
+    for scene_idx, (search_query, scene) in enumerate(zip(scene_queries, scenes)):
+        if not search_query:
+            logger.warning(f"scene {scene_idx}: empty search query, skipping")
+            continue
+            
+        logger.info(f"processing scene {scene_idx + 1}/{len(scenes)}: {search_query[:100]}")
+        
+        # Search Pexels (if configured)
+        pexels_candidates = []
+        if pexels_configured:
+            try:
+                pexels_results = search_videos_pexels(
+                    search_term=search_query,
+                    minimum_duration=max_clip_duration,
+                    video_aspect=video_aspect,
+                )
+                pexels_candidates = pexels_results[:max_candidates_per_source]
+                logger.info(f"pexels: found {len(pexels_candidates)} candidates for scene {scene_idx}")
+            except Exception as e:
+                logger.error(f"pexels search failed for scene {scene_idx}: {type(e).__name__}: {e}")
+
+        # Search Pixabay (if configured)
+        pixabay_candidates = []
+        if pixabay_configured:
+            try:
+                pixabay_results = search_videos_pixabay(
+                    search_term=search_query,
+                    minimum_duration=max_clip_duration,
+                    video_aspect=video_aspect,
+                )
+                pixabay_candidates = pixabay_results[:max_candidates_per_source]
+                logger.info(f"pixabay: found {len(pixabay_candidates)} candidates for scene {scene_idx}")
+            except Exception as e:
+                logger.error(f"pixabay search failed for scene {scene_idx}: {type(e).__name__}: {e}")
+
+
+        # Vision check Pexels candidates (up to 3)
+        selected_item = None
+        selected_source = None
+        
+        for candidate in pexels_candidates:
+            # Rate limit vision checks
+            last_vision_check_time = llm._rate_limit_vision_check(last_vision_check_time)
+            
+            # Get thumbnail URL for vision checking
+            thumbnail_url = _get_thumbnail_url(candidate)
+            if not thumbnail_url:
+                logger.warning(f"pexels candidate {candidate.url}: no thumbnail URL available")
+                continue
+                
+            # Vision check
+            result = llm.check_image_matches_query(
+                image_url=thumbnail_url,
+                search_query=search_query,
+                timeout=vision_check_timeout,
+            )
+            
+            if result == "YES":
+                logger.info(f"pexels candidate accepted by vision checker: {candidate.url}")
+                selected_item = candidate
+                selected_source = "pexels"
+                break
+            elif result == "NO":
+                logger.info(f"pexels candidate rejected by vision checker: {candidate.url}")
+            else:
+                logger.warning(f"pexels candidate vision check failed/error: {candidate.url}")
+
+        # If no Pexels candidate accepted, try Pixabay candidates
+        if selected_item is None:
+            for candidate in pixabay_candidates:
+                # Rate limit vision checks
+                last_vision_check_time = llm._rate_limit_vision_check(last_vision_check_time)
+                
+                thumbnail_url = _get_thumbnail_url(candidate)
+                if not thumbnail_url:
+                    logger.warning(f"pixabay candidate {candidate.url}: no thumbnail URL available")
+                    continue
+                    
+                result = llm.check_image_matches_query(
+                    image_url=thumbnail_url,
+                    search_query=search_query,
+                    timeout=vision_check_timeout,
+                )
+                
+                if result == "YES":
+                    logger.info(f"pixabay candidate accepted by vision checker: {candidate.url}")
+                    selected_item = candidate
+                    selected_source = "pixabay"
+                    break
+                elif result == "NO":
+                    logger.info(f"pixabay candidate rejected by vision checker: {candidate.url}")
+                else:
+                    logger.warning(f"pixabay candidate vision check failed/error: {candidate.url}")
+
+
+        # If a candidate was selected, download it
+        if selected_item is not None:
+            try:
+                saved_video_path = save_video(
+                    selected_item.url,
+                    material_directory,
+                )
+                if saved_video_path:
+                    logger.info(f"downloaded {selected_source} video for scene {scene_idx}: {saved_video_path}")
+                    selected_videos.append(saved_video_path)
+                    
+                    source_info = selected_item.source_info if isinstance(selected_item.source_info, dict) else {}
+                    material_sources.append(_material_source_record(selected_item, saved_video_path))
+                    
+                    total_duration += min(max_clip_duration, selected_item.duration)
+                    on_downloaded(selected_item)
+                    
+                    if total_duration >= audio_duration:
+                        logger.info(f"total duration ({total_duration:.1f}s) covers required audio ({audio_duration:.1f}s), stopping")
+                        break
+                else:
+                    logger.error(f"failed to download {selected_source} video: {selected_item.url}")
+            except Exception as e:
+                logger.error(f"error downloading {selected_source} video: {type(e).__name__}: {e}")
+        else:
+            # Both pools failed - try AI Image/Canvas fallback
+            logger.warning(f"scene {scene_idx}: all stock candidates failed vision check, attempting fallback generation")
+            fallback_video = process_scene_fallback(
+                scene=scene,
+                task_id=task_id,
+                video_aspect=video_aspect,
+                max_clip_duration=max_clip_duration,
+                material_directory=material_directory,
+                image_motion=image_motion,
+                app_config=None,  # Use global config
+            )
+            if fallback_video:
+                logger.info(f"fallback generation succeeded for scene {scene_idx}: {fallback_video}")
+                selected_videos.append(fallback_video)
+                # Create a material source record for the fallback
+                material_sources.append({
+                    "provider": "fallback",
+                    "search_term": scene.get("search_query", ""),
+                    "video_path": fallback_video,
+                    "duration": max_clip_duration,
+                })
+                total_duration += max_clip_duration
+                on_downloaded(type('obj', (object,), {'duration': max_clip_duration})())
+                
+                if total_duration >= audio_duration:
+                    logger.info(f"total duration ({total_duration:.1f}s) covers required audio ({audio_duration:.1f}s), stopping")
+                    break
+            else:
+                logger.error(f"all fallbacks failed for scene {scene_idx}, skipping")
+
+    _persist_material_sources(task_id, material_sources)
+    logger.success(f"downloaded {len(selected_videos)} videos from {len(scenes)} scenes")
+    return selected_videos
